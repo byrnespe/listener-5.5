@@ -1,0 +1,17 @@
+{
+  "service": "listener-5.5",
+  "source_path": "/home/peter/projects/listener-5.5",
+  "runtime": "systemd-user",
+  "default_port": 8555,
+  "bind_default": "127.0.0.1",
+  "unit_path": "systemd/listener55.service",
+  "schema_path": "schema/self_report.schema.json",
+  "entrypoint": "listener55",
+  "healthcheck": "GET /healthz",
+  "metrics": "GET /metrics",
+  "ingest": "POST /events",
+  "env_prefix": "LISTENER55_",
+  "report_url_env": "LISTENER55_REPORT_URL",
+  "report_log_env": "LISTENER55_REPORT_LOG",
+  "kanban_task": "t_cef82db8"
+}

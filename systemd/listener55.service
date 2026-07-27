@@ -1,0 +1,27 @@
+[Unit]
+Description=listener-5.5 HTTP event listener with self-reporting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/listener-5.5
+ExecStart=%h/projects/listener-5.5/.venv/bin/listener55
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=LISTENER55_HOST=127.0.0.1
+Environment=LISTENER55_PORT=8555
+Environment=LISTENER55_REPORT_INTERVAL=30
+Environment=LISTENER55_REPORT_LOG=%h/.local/state/listener55/self-report.jsonl
+Environment=LISTENER55_INSTANCE_ID=%H-listener55
+# Optional monitoring sink:
+# Environment=LISTENER55_REPORT_URL=http://127.0.0.1:8791/api/v1/ingest/listener55
+# EnvironmentFile=-%h/.config/listener55.env
+
+# Hardening (user-level)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://asburyaisolutions.com/schemas/listener55/self-report.schema.json",
+  "title": "Listener55SelfReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "service",
+    "instance_id",
+    "status",
+    "uptime_seconds",
+    "started_at",
+    "reported_at",
+    "listen",
+    "counts",
+    "last_error"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "service": {
+      "type": "string",
+      "const": "listener-5.5"
+    },
+    "instance_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["starting", "healthy", "degraded", "stopping"]
+    },
+    "uptime_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reported_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "listen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port"],
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "received",
+        "processed_ok",
+        "processed_error",
+        "self_reports_sent",
+        "self_reports_failed"
+      ],
+      "properties": {
+        "received": { "type": "integer", "minimum": 0 },
+        "processed_ok": { "type": "integer", "minimum": 0 },
+        "processed_error": { "type": "integer", "minimum": 0 },
+        "self_reports_sent": { "type": "integer", "minimum": 0 },
+        "self_reports_failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "last_error": {
+      "type": ["string", "null"]
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
