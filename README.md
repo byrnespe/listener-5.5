@@ -177,7 +177,11 @@ pip install -e '.[dev]'
 pytest -q
 ```
 
-CI runs the same on push/PR to `main` (see `.github/workflows/ci.yml`).
+CI runs the same on push/PR to `main`
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) across Python 3.10 and
+3.12, with and without the optional `jsonschema`, plus a job that installs the
+package with **no dev extras** and emits a one-shot self-report — proving the
+stdlib-only runtime claim rather than asserting it.
 
 ## Systemd (user unit)
 
