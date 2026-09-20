@@ -47,6 +47,11 @@ class Config:
     instance_id: str
     max_body_bytes: int
     process_fail_rate: float  # test hook only; 0.0 in prod
+    # Fleet-bus knobs. Defaulted so an existing caller that builds Config
+    # positionally keeps working.
+    registry_id: str = "listener-55"  # this service's id in the org registry
+    registry_path: str | None = None  # org registry path; None = auto-discover
+    fleet_stale_after_seconds: float = 90.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -71,6 +76,11 @@ class Config:
             instance_id=instance,
             max_body_bytes=_env_int("LISTENER55_MAX_BODY_BYTES", 1_048_576),
             process_fail_rate=_env_float("LISTENER55_PROCESS_FAIL_RATE", 0.0),
+            registry_id=_env("LISTENER55_REGISTRY_ID", "listener-55") or "listener-55",
+            registry_path=_env("LISTENER55_REGISTRY"),
+            fleet_stale_after_seconds=_env_float(
+                "LISTENER55_FLEET_STALE_AFTER", 90.0
+            ),
         )
 
     def validate(self) -> None:
@@ -84,3 +94,7 @@ class Config:
             raise ValueError("LISTENER55_PROCESS_FAIL_RATE must be in [0,1]")
         if self.report_url is None and self.report_log_path is None:
             raise ValueError("need LISTENER55_REPORT_URL or LISTENER55_REPORT_LOG")
+        if self.fleet_stale_after_seconds <= 0:
+            raise ValueError("LISTENER55_FLEET_STALE_AFTER must be > 0")
+        if not self.registry_id:
+            raise ValueError("LISTENER55_REGISTRY_ID must not be empty")
