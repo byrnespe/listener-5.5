@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from listener55.config import Config
+from listener55.fleet import FleetStore, Roster, resolve_registry_path
 from listener55.reporter import SelfReporter
 from listener55.schema import Metrics
 
@@ -31,6 +32,36 @@ class ListenerState:
             report_log_path=config.report_log_path,
         )
         self._httpd: ThreadingHTTPServer | None = None
+        # The fleet bus: other services POST their self-reports to
+        # /self-report and /fleet rolls them up against the org registry.
+        # A missing registry is not fatal -- the bus still aggregates, it just
+        # cannot say which services are missing.
+        self.fleet = FleetStore(
+            roster=Roster(resolve_registry_path(config.registry_path)),
+            stale_after=config.fleet_stale_after_seconds,
+        )
+
+    def own_report(self) -> dict[str, Any]:
+        """This service's own self-report, carrying its registry id."""
+        payload = self.metrics_payload()
+        payload["registry_id"] = self.config.registry_id
+        return payload
+
+    def metrics_payload(self) -> dict[str, Any]:
+        return self.metrics.build_payload(
+            instance_id=self.config.instance_id,
+            host=self.reporter.host,
+            port=self.reporter.port,
+        )
+
+    def ingest_own_report(self) -> None:
+        """Fold this service's current state into the fleet store.
+
+        Done at read time rather than by POSTing to ourselves: the bus should
+        never be missing from its own roster, and a loopback round trip to
+        achieve that would be silly.
+        """
+        self.fleet.ingest(self.own_report())
 
     def process_item(self, item: Any) -> dict[str, Any]:
         """Process one inbound event. Pure-ish; mutates metrics."""
@@ -95,17 +126,10 @@ def make_handler(state: ListenerState):
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
             if path in ("/healthz", "/health", "/"):
-                counts = state.metrics.snapshot_counts()
-                self._send_json(
-                    200,
-                    {
-                        "status": state.metrics.status,
-                        "service": "listener-5.5",
-                        "instance_id": state.config.instance_id,
-                        "uptime_seconds": round(state.metrics.uptime_seconds(), 3),
-                        "counts": counts,
-                    },
-                )
+                # Contract-shaped, per the org self-report schema. This is a
+                # superset of what this endpoint used to return, so existing
+                # callers keep working.
+                self._send_json(200, state.own_report())
                 return
             if path == "/metrics":
                 payload = state.metrics.build_payload(
@@ -115,17 +139,61 @@ def make_handler(state: ListenerState):
                 )
                 self._send_json(200, payload)
                 return
+            if path == "/fleet":
+                state.ingest_own_report()
+                # Always 200: /fleet is a report about the fleet, not this
+                # service's own health. Returning 503 whenever any peer is
+                # unwell would make the endpoint useless as a data source and
+                # would flap the bus's own monitoring.
+                self._send_json(200, state.fleet.rollup())
+                return
+            if path.startswith("/fleet/"):
+                key = path[len("/fleet/") :].strip("/")
+                if key == state.config.registry_id:
+                    state.ingest_own_report()
+                row = state.fleet.one(key) if key else None
+                if row is None:
+                    self._send_json(
+                        404,
+                        {
+                            "error": "unknown service",
+                            "detail": "not reporting and not in the registry roster",
+                            "id": key,
+                        },
+                    )
+                    return
+                self._send_json(200, row)
+                return
             self._send_json(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
-            if path not in ("/events", "/ingest", "/v1/events"):
+            if path not in ("/events", "/ingest", "/v1/events", "/self-report"):
                 self._send_json(404, {"error": "not found"})
                 return
             try:
                 raw = self._read_body()
             except ValueError as exc:
                 self._send_json(413 if "large" in str(exc) else 400, {"error": str(exc)})
+                return
+
+            if path == "/self-report":
+                try:
+                    report = json.loads(raw.decode("utf-8")) if raw else None
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    self._send_json(400, {"error": f"invalid JSON: {exc}"})
+                    return
+                accepted, errors = state.fleet.ingest(report)
+                if not accepted:
+                    # Reject rather than store: a bus holding malformed health
+                    # is worse than one holding none.
+                    self._send_json(
+                        422, {"ok": False, "error": "invalid self-report", "errors": errors}
+                    )
+                    return
+                self._send_json(
+                    202, {"ok": True, "id": state.fleet.key_for(report)}
+                )
                 return
             if not raw:
                 item: Any = None
