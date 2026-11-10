@@ -267,8 +267,17 @@ class Playbooks:
         self._books: dict[str, dict[str, Any]] = {}
         self._order: list[str] = []
         self._mtime: float | None = None
-        self._last_run: dict[tuple[str, str], float] = {}
-        self._recent_runs: deque[float] = deque()
+        # Cooldowns and the hourly budget are persisted with the outcomes: a
+        # restart must not hand out a fresh allowance.
+        runtime = stats.get("_runtime")
+        if not isinstance(runtime, dict):
+            runtime = stats["_runtime"] = {}
+        if not isinstance(runtime.get("last_run"), dict):
+            runtime["last_run"] = {}
+        if not isinstance(runtime.get("recent"), list):
+            runtime["recent"] = []
+        self._last_run: dict[str, float] = runtime["last_run"]
+        self._recent_runs: list[float] = runtime["recent"]
         self.load_errors: list[str] = []
         self.reload()
 
@@ -338,15 +347,21 @@ class Playbooks:
                 if not fnmatch.fnmatchcase(incident["service"], book["match"]["service"]):
                     continue
                 score, ok, fail = self._score(name, incident["kind"])
+                # In global dry-run mode a logged dry run is the attempt;
+                # otherwise the same "would run" line repeats every tick.
                 used = sum(
                     1
                     for a in incident.get("actions", [])
-                    if a.get("playbook") == name and not a.get("dry_run")
+                    if a.get("playbook") == name and (self.dry_run or not a.get("dry_run"))
                 )
-                last = self._last_run.get((name, incident["service"]))
+                last = self._last_run.get(f"{name}|{incident['service']}")
                 cooldown_left = max(0.0, book["cooldown_seconds"] - (now - last)) if last else 0.0
                 blocked: str | None = None
-                if not registered and not book["allow_unregistered"]:
+                if not SAFE_ID.match(incident["service"]):
+                    blocked = "service id is not a plain identifier"
+                elif not self.dry_run and self._runs_last_hour() >= self.max_per_hour:
+                    blocked = f"action budget exhausted ({self.max_per_hour}/hour)"
+                elif not registered and not book["allow_unregistered"]:
                     blocked = "service is not in the registry and playbook does not allow_unregistered"
                 elif used >= book["max_attempts"]:
                     blocked = "max_attempts reached for this incident"
@@ -390,7 +405,7 @@ class Playbooks:
                     "outcomes": {
                         k.split("|", 1)[1]: v
                         for k, v in self._stats.items()
-                        if k.startswith(b["name"] + "|")
+                        if k != "_runtime" and k.startswith(b["name"] + "|")
                     },
                 }
                 for b in (self._books[n] for n in self._order)
@@ -407,7 +422,7 @@ class Playbooks:
     def _runs_last_hour(self) -> int:
         cutoff = self._wall() - 3600
         while self._recent_runs and self._recent_runs[0] < cutoff:
-            self._recent_runs.popleft()
+            self._recent_runs.pop(0)
         return len(self._recent_runs)
 
     # ------------------------------------------------------------------ run
@@ -473,13 +488,16 @@ class Playbooks:
             if used >= book["max_attempts"]:
                 return refuse("max_attempts reached for this incident")
             now = self._wall()
-            last = self._last_run.get((name, service))
+            last = self._last_run.get(f"{name}|{service}")
             if last is not None and now - last < book["cooldown_seconds"]:
                 return refuse(f"cooling down for {book['cooldown_seconds'] - (now - last):.0f}s")
             if self._runs_last_hour() >= self.max_per_hour:
                 return refuse(f"action budget exhausted ({self.max_per_hour}/hour)")
-            self._last_run[(name, service)] = now
+            self._last_run[f"{name}|{service}"] = now
             self._recent_runs.append(now)
+            for k in [k for k, t in self._last_run.items() if now - t > 86400]:
+                del self._last_run[k]
+        self._touch()
 
         started = time.monotonic()
         try:

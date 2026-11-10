@@ -590,7 +590,12 @@ class AgentAPI:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ToolError("invalid_arguments", "arguments must be a JSON object", 422)
-            if tool.privileged:
+            # With a report token set, pushing a self-report is no longer
+            # something anyone may do, through this door or the front one.
+            gated = tool.privileged or (
+                tool.name == "submit_self_report" and bool(self.state.config.report_token)
+            )
+            if gated:
                 if not self.state.config.agent_token:
                     raise ToolError(
                         "forbidden",
@@ -616,10 +621,20 @@ class AgentAPI:
             detail = f"{exc.code}: {exc.message}"
             raise
         finally:
-            self._record(name, arguments, actor, transport, ok, detail, bool(tool and tool.privileged))
+            self._record(
+                name, arguments, actor, transport, ok, detail, bool(tool and tool.privileged), authorized
+            )
 
     def _record(
-        self, name: str, arguments: Any, actor: str, transport: str, ok: bool, detail: str, privileged: bool
+        self,
+        name: str,
+        arguments: Any,
+        actor: str,
+        transport: str,
+        ok: bool,
+        detail: str,
+        privileged: bool,
+        authorized: bool,
     ) -> None:
         try:
             args = json.dumps(arguments, default=str)[:500]
@@ -639,8 +654,10 @@ class AgentAPI:
         with self._lock:
             self.calls += 1
             self._audit.append(rec)
-        # Reads are high-volume and change nothing; only writes go to disk.
-        if privileged or not ok:
+        # Only calls made with the token reach the durable trail. Anonymous
+        # calls, failed or not, stay in the memory ring: if they were written
+        # to disk, anyone could rotate the real history out of the file.
+        if privileged and authorized:
             self.state.brain.store.append_audit(rec)
 
     # ------------------------------------------------------------------ MCP
@@ -735,8 +752,11 @@ class AgentAPI:
                 text, mime = GUIDE, "text/markdown"
             elif uri in reads:
                 tool, args = reads[uri]
-                text = json.dumps(self.call(tool, args, authorized=authorized, actor=actor, transport=transport), default=str)
-                mime = "application/json"
+                try:
+                    data = self.call(tool, args, authorized=authorized, actor=actor, transport=transport)
+                except ToolError as exc:
+                    return _rpc_error(rid, -32603, f"{exc.code}: {exc.message}")
+                text, mime = json.dumps(data, default=str), "application/json"
             else:
                 return _rpc_error(rid, -32002, f"resource not found: {uri!r}")
             return _rpc_result(rid, {"contents": [{"uri": uri, "mimeType": mime, "text": text}]})
@@ -786,6 +806,15 @@ def _rpc_result(rid: Any, result: Any) -> dict[str, Any]:
 
 def _rpc_error(rid: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+def _is_jsonrpc(body: str) -> bool:
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    items = doc if isinstance(doc, list) else [doc]
+    return bool(items) and all(isinstance(m, dict) and m.get("jsonrpc") == "2.0" for m in items)
 
 
 def _gemini_schema(schema: Any) -> Any:
@@ -846,7 +875,9 @@ def run_stdio_bridge(
                 body = resp.read().decode("utf-8").strip()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace").strip()
-            if not body.startswith(("{", "[")):
+            if not _is_jsonrpc(body):
+                # An HTTP-level failure (too large, 500) is not something an
+                # MCP client can parse. Answer every pending id in its terms.
                 for rid in ids:
                     emit(_rpc_error(rid, -32000, f"listener answered HTTP {exc.code}"))
                 continue

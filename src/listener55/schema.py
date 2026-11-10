@@ -137,7 +137,9 @@ class Metrics:
         reasons: list[str] = []
         total = len(self._outcomes)
         errors = sum(1 for _, ok in self._outcomes if not ok)
-        if errors and errors / total > HEALTH_ERROR_RATIO:
+        # Two or more: a single failure is an event, not a trend, however
+        # small the sample it lands in.
+        if errors >= 2 and errors / total > HEALTH_ERROR_RATIO:
             reasons.append(
                 f"event error rate {errors}/{total} over the last "
                 f"{int(HEALTH_WINDOW_SECONDS)}s"

@@ -251,6 +251,34 @@ def test_an_outage_gap_is_not_learned_as_cadence():
     assert b.describe("alpha")["interval_seconds"] == pytest.approx(10.0)
 
 
+def test_a_changed_cadence_is_relearned_instead_of_flapping_forever():
+    b, _ = baselines()
+    t = feed(b, "alpha", 10, 5.0)
+    assert b.threshold("alpha", 90.0)[0] == 15.0
+    feed(b, "alpha", 12, 60.0, start=t)
+    assert b.describe("alpha")["interval_seconds"] == pytest.approx(60.0)
+    assert b.threshold("alpha", 90.0)[0] == pytest.approx(180.0)
+
+
+def test_a_replay_burst_does_not_collapse_the_learned_cadence():
+    b, _ = baselines()
+    t = feed(b, "alpha", 10, 30.0)
+    for n in range(26):
+        b.observe("alpha", report("alpha"), t + n * 0.002)  # a peer replaying its spool
+    feed(b, "alpha", 5, 30.0, start=t + 30.0)
+    assert b.describe("alpha")["interval_seconds"] == pytest.approx(30.0, rel=0.05)
+
+
+def test_oversized_wire_values_are_not_stored(tmp_path):
+    store = StateStore(tmp_path)
+    b = Baselines(store.section("baselines"), store.touch)
+    huge = "x" * 200_000
+    for n in range(5):
+        b.observe("alpha", report("alpha", started=huge + str(n), counts={huge + "_error": n}), n * 10.0)
+    store.save()
+    assert (tmp_path / "state.json").stat().st_size < 5_000
+
+
 def test_restart_is_detected_by_a_new_started_at():
     b, _ = baselines()
     b.observe("alpha", report("alpha", started="A"), 0.0)
@@ -392,6 +420,17 @@ def test_incident_memory_survives_a_restart(tmp_path):
     assert nxt["id"] != inc["id"]
 
 
+def test_incident_memory_is_bounded():
+    from listener55.incidents import MAX_MEMORY
+
+    log = IncidentLog({}, lambda: None)
+    for n in range(MAX_MEMORY + 50):
+        log.open("alpha", "degraded", severity="warning", summary="s" * 5000, error_text=f"err-{chr(97 + n % 26)}{'q' * (n // 26)}")
+        log.resolve("alpha", "degraded")
+    assert len(log._s["memory"]) == MAX_MEMORY
+    assert len(log.list("resolved", limit=1)[0]["summary"]) == 500
+
+
 def test_stats_report_mttr_and_recurring_failures():
     wall = Clock()
     log = IncidentLog({}, lambda: None, wall=wall)
@@ -520,6 +559,22 @@ def test_a_report_the_sink_rejects_does_not_block_the_queue(tmp_path):
     assert r.spool_dropped == 1
 
 
+def test_a_sink_briefly_rejecting_everything_does_not_empty_the_spool(tmp_path):
+    mode = ["down"]
+
+    def post(url, body, timeout):
+        if mode[0] == "down":
+            raise OSError("down")
+        return 401, ""
+
+    r, _ = reporter_with(tmp_path, post, breaker=CircuitBreaker(failure_threshold=10_000))
+    for _ in range(100):
+        r.emit_once()
+    mode[0] = "rejecting"
+    r.emit_once()
+    assert r.spooled() >= 75  # at most one cycle's worth was given up on
+
+
 def test_spool_is_bounded(tmp_path):
     def post(url, body, timeout):
         raise OSError("down")
@@ -567,13 +622,16 @@ def test_a_high_error_rate_degrades_and_says_why():
     m.set_status("healthy")
     m.mark_ok()
     m.mark_error("boom")
+    assert m.status == "healthy"  # one failure is an event, not a trend
+    m.mark_error("boom")
     assert m.status == "degraded"
-    assert "error rate 1/2" in m.degraded_reasons()[0]
+    assert "error rate 2/3" in m.degraded_reasons()[0]
 
 
 def test_old_errors_age_out_without_new_traffic(monkeypatch):
     m = Metrics()
     m.set_status("healthy")
+    m.mark_error("boom")
     m.mark_error("boom")
     assert m.status == "degraded"
     monkeypatch.setattr(schema_mod, "HEALTH_WINDOW_SECONDS", 0.0)
@@ -659,6 +717,27 @@ def test_cooldown_and_hourly_budget_are_enforced(tmp_path):
     assert "budget" in pb.run("restart", incident(), actor="a", registered=True)["detail"]
     wall.advance(3600)
     assert pb.run("restart", incident(), actor="a", registered=True)["ok"]
+
+
+def test_cooldown_and_budget_survive_a_restart(tmp_path):
+    wall = Clock()
+    path = tmp_path / "pb.json"
+    path.write_text(json.dumps({"playbooks": [dict(RESTART, cooldown_seconds=300, max_attempts=99)]}), encoding="utf-8")
+    stats: dict = {}
+    first = Playbooks(str(path), stats, lambda: None, runner=lambda a, t: (True, ""), wall=wall)
+    assert first.run("restart", incident(), actor="a", registered=True)["ok"]
+    reborn = Playbooks(str(path), json.loads(json.dumps(stats)), lambda: None, runner=lambda a, t: (True, ""), wall=wall)
+    assert "cooling down" in reborn.run("restart", incident(), actor="a", registered=True)["detail"]
+    assert reborn.describe()["actions_last_hour"] == 1
+
+
+def test_candidates_say_when_the_budget_or_the_id_blocks_them(tmp_path):
+    pb = books(tmp_path, [dict(RESTART, max_attempts=99)], runner=lambda a, t: (True, ""), max_per_hour=1)
+    assert pb.candidates(incident(), registered=True)[0]["runnable"] is True
+    assert pb.candidates(incident(service="--force"), registered=True)[0]["runnable"] is False
+    pb.run("restart", incident(service="beta"), actor="a", registered=True)
+    blocked = pb.candidates(incident(), registered=True)[0]
+    assert blocked["runnable"] is False and "budget" in blocked["blocked_reason"]
 
 
 def test_candidates_are_ranked_by_what_actually_cleared_incidents(tmp_path):
@@ -812,8 +891,54 @@ def test_a_remembered_peer_going_quiet_is_noticed_without_changing_the_verdict(t
     assert roll["learned_attention"] == ["stranger"]
 
 
-def test_learned_cadence_changes_when_a_service_counts_as_stale(tmp_path):
+def test_by_default_a_learned_threshold_never_tightens_below_the_configured_window(tmp_path):
     brain, _ = build(tmp_path)
+    all_report(brain)
+    for n in range(10):
+        brain.baselines.observe("alpha", report("alpha"), float(n * 5))
+    assert brain.fleet.one("alpha")["stale_after_seconds"] == 90.0
+    for n in range(10):
+        brain.baselines.observe("beta", report("beta"), float(n * 300))
+    row = brain.fleet.one("beta")
+    assert row["threshold_source"] == "learned" and row["stale_after_seconds"] == 900.0
+
+
+def test_spoofed_rapid_reports_cannot_make_a_healthy_service_look_stale(tmp_path):
+    ran: list = []
+    brain, _ = build(tmp_path, playbooks=[RESTART], runner=lambda a, t: (ran.append(a) or True, ""), autonomy="act")
+    all_report(brain)
+    for n in range(40):
+        brain.baselines.observe("alpha", report("alpha"), 100.0 + n * 0.01)  # a burst
+    age(brain.fleet, "alpha", 30)  # the real service reports every 30s
+    brain.tick()
+    time.sleep(0.1)
+    assert brain.fleet.one("alpha")["state"] == "healthy"
+    assert brain.incidents.open_incidents() == [] and ran == []
+
+
+def test_remembered_strangers_cannot_fake_a_correlated_outage(tmp_path):
+    ran: list = []
+    brain, _ = build(
+        tmp_path,
+        playbooks=[RESTART],
+        runner=lambda a, t: (ran.append(a) or True, ""),
+        autonomy="act",
+        learn_roster_after=3,
+    )
+    all_report(brain)
+    for n in range(6):
+        for _ in range(3):
+            brain.fleet.ingest(report(f"fake-{n}"))
+        age(brain.fleet, f"fake-{n}", 500)
+    age(brain.fleet, "alpha", 500)
+    brain.tick()
+    assert brain.storm is False
+    wait_for(lambda: ran)
+    assert ran == [["svc", "restart", "alpha"]]  # the real outage is still handled
+
+
+def test_learned_cadence_changes_when_a_service_counts_as_stale(tmp_path):
+    brain, _ = build(tmp_path, adaptive_tighten=True)
     all_report(brain)
     for n in range(10):
         brain.baselines.observe("alpha", report("alpha"), float(n * 5))
@@ -906,6 +1031,52 @@ def test_a_playbook_that_exits_zero_but_fixes_nothing_is_scored_a_failure(tmp_pa
     wall.advance(121)  # verify window passes, still stale
     brain.tick()
     assert brain.playbooks.describe()["playbooks"][0]["outcomes"] == {"stale": {"ok": 0, "fail": 1}}
+
+
+def test_blocked_or_dry_run_actions_are_not_repeated_every_tick(tmp_path):
+    brain, _ = build(tmp_path, playbooks=[RESTART], runner=lambda a, t: (True, ""), autonomy="act")
+    brain.playbooks.dry_run = True
+    all_report(brain)
+    age(brain.fleet, "alpha", 500)
+    for _ in range(15):
+        brain.tick()
+        time.sleep(0.02)
+    actions = brain.incidents.get_open("alpha", "stale")["actions"]
+    assert len(actions) == RESTART["max_attempts"] and all(a["dry_run"] for a in actions)
+
+
+def test_a_bus_restart_leaves_unknown_and_degraded_incidents_alone(tmp_path):
+    state = str(tmp_path / "st")
+    brain, _ = build(tmp_path, state_dir=state)
+    for key in ("alpha", "gamma", "delta"):
+        brain.fleet.ingest(report(key))
+    brain.fleet.ingest(report("alpha", status="degraded", last_error="db down"))
+    brain.tick()
+    before = sorted((i["service"], i["kind"], i["id"]) for i in brain.incidents.open_incidents())
+    assert [b[:2] for b in before] == [("alpha", "degraded"), ("beta", "unknown")]
+    brain.stop()
+
+    reborn, _ = build(tmp_path, state_dir=state)
+    reborn.grace_seconds = 3600
+    reborn.tick()
+    after = sorted((i["service"], i["kind"], i["id"]) for i in reborn.incidents.open_incidents())
+    assert after == before
+    assert reborn.incidents.list("resolved") == []
+
+
+def test_correcting_a_verdict_does_not_count_twice(tmp_path):
+    brain, wall = build(tmp_path)
+    all_report(brain)
+    age(brain.fleet, "alpha", 100)
+    brain.tick()
+    inc = brain.incidents.get_open("alpha", "stale")
+    wall.advance(5)
+    brain.fleet.ingest(report("alpha"))
+    brain.tick()  # auto-judged a false alarm
+    brain.incident_feedback(inc["id"], "real", "agent-a")
+    base = brain.baselines.describe("alpha")
+    assert (base["false_alarms"], base["real_outages"]) == (0, 1)
+    assert base["tolerance"] == pytest.approx(DEFAULT_TOLERANCE, abs=0.01)
 
 
 def test_suggest_autonomy_recommends_but_does_not_run(tmp_path):
@@ -1093,7 +1264,7 @@ def test_the_fleet_store_cannot_be_grown_without_bound(tmp_path):
 
 
 def test_insights_summarise_what_was_learned(tmp_path):
-    brain, _ = build(tmp_path, learn_roster_after=3)
+    brain, _ = build(tmp_path, learn_roster_after=3, adaptive_tighten=True)
     all_report(brain)
     for n in range(10):
         brain.baselines.observe("alpha", report("alpha"), float(n * 10))

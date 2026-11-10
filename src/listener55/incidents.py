@@ -25,6 +25,10 @@ MAX_HISTORY = 500
 MAX_NOTES = 20
 MAX_NOTE_CHARS = 2000
 MAX_ACTIONS = 50
+#: Fingerprints remembered. Error text comes off the wire, so a peer that
+#: varies it could otherwise mint fingerprints without end.
+MAX_MEMORY = 500
+MAX_SUMMARY_CHARS = 500
 
 _VOLATILE = re.compile(r"0x[0-9a-fA-F]+|\d+")
 
@@ -34,6 +38,13 @@ def fingerprint(service: str, kind: str, error_text: str | None = None) -> str:
     timestamp in an error message does not make every occurrence unique."""
     norm = _VOLATILE.sub("N", (error_text or "").strip().lower())[:200]
     return hashlib.sha1(f"{kind}|{service}|{norm}".encode("utf-8")).hexdigest()[:12]
+
+
+def _bounded(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Evidence quotes what services said about themselves; keep it short."""
+    return {
+        k: (v[:MAX_SUMMARY_CHARS] if isinstance(v, str) else v) for k, v in evidence.items()
+    }
 
 
 class IncidentLog:
@@ -80,7 +91,7 @@ class IncidentLog:
             existing = self.get_open(service, kind)
             if existing is not None:
                 if evidence:
-                    existing["evidence"].update(evidence)
+                    existing["evidence"].update(_bounded(evidence))
                     existing["updated_at"] = utc_now_iso()
                 return existing, False
             self._s["seq"] += 1
@@ -90,6 +101,16 @@ class IncidentLog:
             )
             mem["count"] += 1
             mem["last_seen"] = utc_now_iso()
+            if len(self._s["memory"]) > MAX_MEMORY:
+                live = {i["fingerprint"] for i in self._s["open"].values()} | {fp}
+                # Forget the failures seen least, oldest first; never one that
+                # is open right now.
+                victims = sorted(
+                    (k for k in self._s["memory"] if k not in live),
+                    key=lambda k: (self._s["memory"][k]["count"], self._s["memory"][k].get("last_seen", "")),
+                )
+                for k in victims[: len(self._s["memory"]) - MAX_MEMORY]:
+                    del self._s["memory"][k]
             inc = {
                 "id": f"inc-{self._s['seq']:06d}",
                 "service": service,
@@ -98,8 +119,8 @@ class IncidentLog:
                 "status": "open",
                 "fingerprint": fp,
                 "occurrence": mem["count"],
-                "summary": summary,
-                "evidence": dict(evidence or {}),
+                "summary": summary[:MAX_SUMMARY_CHARS],
+                "evidence": _bounded(evidence or {}),
                 "opened_at": utc_now_iso(),
                 "opened_epoch": self._wall(),
                 "updated_at": utc_now_iso(),

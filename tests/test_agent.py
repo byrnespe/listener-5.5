@@ -396,8 +396,41 @@ def test_every_call_is_audited_and_writes_reach_disk(live, tmp_path):
         ("anonymous", "set_autonomy", False),
     ]
     on_disk = [json.loads(line) for line in (tmp_path / "state" / "audit.jsonl").read_text().splitlines()]
-    assert [(e["tool"], e["ok"]) for e in on_disk] == [("set_autonomy", True), ("set_autonomy", False)]
+    # Only calls made with the token are durable; see the flooding test below.
+    assert [(e["tool"], e["ok"]) for e in on_disk] == [("set_autonomy", True)]
     assert TOKEN not in (tmp_path / "state" / "audit.jsonl").read_text()
+
+
+def test_anonymous_callers_cannot_flush_the_durable_audit_trail(live, tmp_path):
+    _, base = live
+    tool(base, "set_autonomy", {"level": "observe"}, token=TOKEN)
+    for _ in range(30):
+        tool(base, "no_such_tool")
+        tool(base, "set_autonomy", {"level": "observe"})
+    lines = (tmp_path / "state" / "audit.jsonl").read_text().splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["ok"] is True
+
+
+def test_self_reports_can_be_required_to_carry_a_token(tmp_path):
+    report_token = "report-token-0123456789"
+    svc, base = start(tmp_path, report_token=report_token)
+    try:
+        assert http(base, "/self-report", report())[0] == 401
+        assert http(base, "/self-report", report(), token="wrong-token-0123456789")[0] == 401
+        assert http(base, "/self-report", report(), token=report_token)[0] == 202
+        # the tool door is shut the same way
+        assert tool(base, "submit_self_report", {"report": report()})[0] == 401
+        assert tool(base, "submit_self_report", {"report": report()}, token=TOKEN)[0] == 200
+    finally:
+        svc.stop()
+
+
+def test_a_web_page_cannot_feed_the_bus(live):
+    _, base = live
+    evil = {"Origin": "https://evil.example"}
+    assert http(base, "/self-report", report(), headers=evil)[0] == 403
+    assert http(base, "/events", {"a": 1}, headers=evil)[0] == 403
+    assert http(base, "/self-report", report())[0] == 202
 
 
 # ----------------------------------------------------------------- MCP/HTTP
@@ -501,6 +534,18 @@ def test_stdio_bridge_relays_to_the_running_listener(live):
     assert replies[1]["result"]["isError"] is False  # the bridge forwarded the token
     assert replies[2]["error"]["code"] == -32700
     assert all("\n" not in json.dumps(r) for r in replies)
+
+
+def test_stdio_bridge_never_emits_a_non_jsonrpc_line(tmp_path):
+    svc, base = start(tmp_path, max_body_bytes=200)
+    try:
+        big = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {"pad": "x" * 500}})
+        replies = bridge(base, [big])
+    finally:
+        svc.stop()
+    assert len(replies) == 1
+    assert replies[0]["jsonrpc"] == "2.0" and replies[0]["id"] == 5
+    assert "HTTP 413" in replies[0]["error"]["message"]
 
 
 def test_stdio_bridge_reports_an_unreachable_listener():

@@ -51,6 +51,7 @@ class ListenerState:
             interval_seconds=config.report_interval_seconds,
             report_url=config.report_url,
             report_log_path=config.report_log_path,
+            auth_token=config.report_url_token,
             spool=spool_section["items"],
             on_spool_change=self.store.touch,
             replay=config.report_replay,
@@ -458,7 +459,25 @@ def make_handler(state: ListenerState):
                 self._post_agent(path, raw)
                 return
 
+            # Browsers always send Origin on a cross-site POST; services and
+            # CLIs do not. A page must not be able to feed the bus.
+            if not self._origin_ok():
+                self._send_json(403, {"ok": False, "error": "origin not allowed"})
+                return
+
             if path == "/self-report":
+                expected = state.config.report_token
+                if expected:
+                    scheme, _, given = (self.headers.get("Authorization") or "").partition(" ")
+                    if scheme.lower() != "bearer" or not hmac.compare_digest(
+                        given.strip().encode("utf-8"), expected.encode("utf-8")
+                    ):
+                        self._send_json(
+                            401,
+                            {"ok": False, "error": "self-reports need Authorization: Bearer <report token>"},
+                            {"WWW-Authenticate": "Bearer"},
+                        )
+                        return
                 try:
                     report = json.loads(raw.decode("utf-8")) if raw else None
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -568,6 +587,11 @@ class ListenerService:
             probe_host = f"[{probe_host}]"
         self.state.brain.probe_url = f"http://{probe_host}:{bound_port}/livez"
         self.state.brain.start()
+        if self.state.brain.autonomy == "act" and not self.config.report_token:
+            log.warning(
+                "autonomy is 'act' but LISTENER55_REPORT_TOKEN is unset: anyone who can reach "
+                "this port can send a self-report, and self-reports can trigger playbooks"
+            )
         sd_notify("READY=1")
         log.info(
             "listening on %s:%s instance=%s report_interval=%ss",

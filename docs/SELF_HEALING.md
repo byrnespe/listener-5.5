@@ -27,8 +27,8 @@ Everything the service repairs in itself is logged and exposed in
 
 `status` used to flip to `degraded` on any one bad event and back on the next
 good one. It is now derived from the last 50 events inside 5 minutes: degraded
-when more than 20% failed, or when three self-reports in a row could not be
-delivered. Errors age out on their own, so a failure an hour ago on an idle
+when two or more failed and that is over 20% of the window, or when three
+self-reports in a row could not be delivered. Errors age out on their own, so a failure an hour ago on an idle
 service no longer reads as degraded forever. The reasons are published as
 `degraded_reasons` on `/healthz`.
 
@@ -40,11 +40,18 @@ model runs inside the service.
 **Cadence, per service.** A running mean and deviation of the gap between
 reports. Once five gaps have been seen, that service's stale threshold becomes
 `tolerance × interval + 4 × deviation`, clamped to
-`LISTENER55_ADAPTIVE_FLOOR`..`LISTENER55_ADAPTIVE_CEILING` (15s..1h). A service
-that pushes every 10s is flagged after ~30s instead of 90s; one that pushes
-every 5 minutes is no longer permanently stale. `/fleet` rows show
-`stale_after_seconds` and whether it is `learned` or `configured`. Set
-`LISTENER55_ADAPTIVE=0` to keep the single fixed window.
+`LISTENER55_ADAPTIVE_FLOOR`..`LISTENER55_ADAPTIVE_CEILING` (15s..1h). A
+service that pushes every 5 minutes is no longer permanently stale. `/fleet`
+rows show `stale_after_seconds` and whether it is `learned` or `configured`.
+Set `LISTENER55_ADAPTIVE=0` to keep the single fixed window.
+
+By default a learned threshold is never *shorter* than
+`LISTENER55_FLEET_STALE_AFTER`. Tightening (a 10s reporter flagged after ~30s)
+is opt-in with `LISTENER55_ADAPTIVE_TIGHTEN=1`, because it trusts report
+timing and reports are only as trustworthy as whoever can reach the port.
+Bursts (gaps under a second, such as a peer replaying its spool) are ignored,
+single outage gaps are not learned, and five out-of-band gaps in a row are
+taken as a changed cadence and re-learned.
 
 **Tolerance.** Starts at 3 missed pushes. When a staleness alarm clears
 quickly with no restart and nobody acting, it was a late report: tolerance
@@ -154,6 +161,17 @@ who can reach the port may send, so:
 - a playbook will not run against a service that is not in the registry
   unless it sets `allow_unregistered: true`;
 - there is no shell, so an id can never become a second command.
+
+**Self-reports are the trigger.** `POST /self-report` is unauthenticated
+unless `LISTENER55_REPORT_TOKEN` is set, so without it anyone who can reach
+the port can claim a registered service is degraded or restarting, and in
+`act` that runs its playbook (within the cooldown and hourly budget, which
+they can also use up). Set the report token before enabling `act`, and give
+reporters the same value. Cross-site browser requests to `/self-report` and
+`/events` are refused regardless. The correlated-outage test counts registry
+services only, so remembered strangers cannot switch remediation off.
+
+Cooldowns and the hourly budget are persisted and survive a restart.
 
 Write playbooks with that in mind: `allow_unregistered` on a `command`
 playbook means a stranger's self-report can cause that command to run with a

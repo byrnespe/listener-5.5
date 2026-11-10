@@ -88,6 +88,7 @@ class Brain:
             ceiling=config.adaptive_ceiling_seconds,
             roster_after=config.learn_roster_after,
             forget_after=config.forget_after_seconds,
+            min_threshold=0.0 if config.adaptive_tighten else config.fleet_stale_after_seconds,
             wall=wall,
         )
         self.incidents = IncidentLog(self.store.section("incidents"), self.store.touch, wall=wall)
@@ -399,14 +400,21 @@ class Brain:
         roll = self.fleet.rollup()
         own = self.config.registry_id
         grace_over = self._clock() - self._started >= self.grace_seconds
+        uptime = self._clock() - self._started
         wanted: dict[tuple[str, str], dict[str, Any]] = {}
+        # The correlated-outage test counts registry services only. Peers the
+        # bus merely remembers are not evidence of anything shared, and since
+        # anyone can become "remembered" by reporting, counting them would let
+        # a stranger switch automatic remediation off.
         watched = 0
         stale: list[str] = []
+        keep: set[tuple[str, str]] = set()
         for row in roll["services"]:
             key = row["id"]
             if key == own or not (row["expected"] or row.get("learned")):
                 continue
-            watched += 1
+            if row["expected"]:
+                watched += 1
             severity = "critical" if row["expected"] else "warning"
             evidence = {
                 "stale_after_seconds": row["stale_after_seconds"],
@@ -416,7 +424,8 @@ class Brain:
                 "watched_because": "registry" if row["expected"] else "learned",
             }
             if row["state"] == STATE_STALE:
-                stale.append(key)
+                if row["expected"]:
+                    stale.append(key)
                 wanted[(key, "stale")] = {
                     "severity": severity,
                     "summary": (
@@ -430,12 +439,17 @@ class Brain:
                     # The bus restarted while this service was already down.
                     # "No report since boot" is not news and is not recovery:
                     # keep the incident that was open, do not close it.
-                    stale.append(key)
+                    if row["expected"]:
+                        stale.append(key)
                     wanted[(key, "stale")] = {
                         "severity": severity,
                         "summary": f"{key} was silent before this bus restarted and still is",
                         "evidence": {"bus_restarted_during_incident": True},
                     }
+                elif uptime < max(self.grace_seconds, row["stale_after_seconds"]) and self.grace_seconds:
+                    # Too soon after boot to know anything about this service.
+                    # Whatever was open for it stays exactly as it was.
+                    keep.update((key, k) for k in FLEET_KINDS)
                 elif grace_over:
                     wanted[(key, "unknown")] = {
                         "severity": severity,
@@ -474,7 +488,8 @@ class Brain:
         for (service, kind), spec in wanted.items():
             self._open(service, kind, **spec)
         for inc in self.incidents.open_incidents():
-            if inc["kind"] in FLEET_KINDS and (inc["service"], inc["kind"]) not in wanted:
+            pair = (inc["service"], inc["kind"])
+            if inc["kind"] in FLEET_KINDS and pair not in wanted and pair not in keep:
                 self._resolved(self.incidents.resolve(inc["service"], inc["kind"]))
 
     def _evaluate_self(self) -> None:
@@ -621,6 +636,8 @@ class Brain:
         previous = inc.get("verdict")
         tolerance = None
         if inc["kind"] == "stale" and previous != verdict:
+            if previous in ("real", "false_alarm"):
+                self.baselines.undo_feedback(inc["service"], previous == "real")
             tolerance = self.baselines.feedback(inc["service"], verdict == "real")
         self.incidents.set_field(incident_id, "verdict", verdict)
         self.incidents.set_field(incident_id, "verdict_by", actor)

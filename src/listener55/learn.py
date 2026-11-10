@@ -45,6 +45,13 @@ SPIKE_MIN_DELTA = 3
 FLAP_WINDOW_SECONDS = 600.0
 FLAP_RESTARTS = 3
 MAX_COUNTERS = 32  # a peer cannot make the bus track unbounded series
+MAX_NAME_CHARS = 64  # counter names and start identities come off the wire
+#: Gaps shorter than this say nothing about cadence: they are a burst (a peer
+#: replaying its spool, a retry storm), not a rhythm.
+MIN_SAMPLE_GAP = 1.0
+#: This many out-of-band gaps in a row is a changed cadence, not an outage or
+#: a burst, and the baseline re-learns from them.
+RELEARN_AFTER = 5
 
 _ERRORISH = re.compile(r"(error|fail|exception|timeout|dropped|rejected)", re.I)
 
@@ -67,8 +74,12 @@ class Baselines:
         min_samples: int = 5,
         roster_after: int = 20,
         forget_after: float = 86400.0,
+        min_threshold: float = 0.0,
         wall: Callable[[], float] = time.time,
     ) -> None:
+        #: Learned thresholds never go below this. The supervisor sets it to
+        #: the configured stale window unless tightening was opted into.
+        self.min_threshold = min_threshold
         self._s = section
         self._touch = touch
         self.enabled = enabled
@@ -119,19 +130,39 @@ class Baselines:
             # --- cadence. A gap longer than the current threshold was an
             # outage, not a sample of the service's rhythm; learning from it
             # would teach the bus to tolerate the very thing it should flag.
-            if gap is not None and gap > 0:
+            # A gap far shorter than the rhythm is a burst and is treated the
+            # same way. But several out-of-band gaps in a row mean the cadence
+            # itself changed, and refusing to learn that would leave the
+            # service flapping forever against a stale baseline.
+            if gap is not None and gap >= MIN_SAMPLE_GAP:
                 limit = self._threshold_locked(e)
-                if limit is None or gap <= limit:
-                    if e["interval"] is None:
+                interval = e["interval"]
+                too_long = limit is not None and gap > limit
+                too_short = interval is not None and e["intervals"] >= self.min_samples and gap < 0.25 * interval
+                if too_long or too_short:
+                    run = e.get("odd", [])
+                    side = "long" if too_long else "short"
+                    run = [g for g in run if g[0] == side] + [[side, gap]]
+                    e["odd"] = run[-RELEARN_AFTER:]
+                    if len(run) >= RELEARN_AFTER:
+                        gaps = sorted(g[1] for g in e["odd"])
+                        e["interval"] = gaps[len(gaps) // 2]
+                        e["dev"] = 0.0
+                        e["odd"] = []
+                        signals.append({"kind": "cadence_changed", "interval_seconds": round(e["interval"], 3)})
+                else:
+                    e["odd"] = []
+                    if interval is None:
                         e["interval"] = gap
                     else:
-                        e["dev"] = (1 - ALPHA) * e["dev"] + ALPHA * abs(gap - e["interval"])
-                        e["interval"] = (1 - ALPHA) * e["interval"] + ALPHA * gap
+                        e["dev"] = (1 - ALPHA) * e["dev"] + ALPHA * abs(gap - interval)
+                        e["interval"] = (1 - ALPHA) * interval + ALPHA * gap
                     e["intervals"] += 1
 
             # --- restarts.
             started = report.get("started_at")
             if isinstance(started, str) and started:
+                started = started[:MAX_NAME_CHARS]
                 seen = e["started"]
                 if seen and started not in seen:
                     e["restarts"].append(now_wall)
@@ -158,6 +189,8 @@ class Baselines:
                 restarted = any(s["kind"] == "restart" for s in signals)
                 for name, value in counts.items():
                     if not isinstance(value, int) or isinstance(value, bool):
+                        continue
+                    if not isinstance(name, str) or len(name) > MAX_NAME_CHARS:
                         continue
                     if not is_error_counter(name):
                         continue
@@ -199,7 +232,7 @@ class Baselines:
         if not self.enabled or e["interval"] is None or e["intervals"] < self.min_samples:
             return None
         raw = e["tol"] * e["interval"] + 4.0 * e["dev"]
-        return max(self.floor, min(self.ceiling, raw))
+        return max(self.floor, self.min_threshold, min(self.ceiling, raw))
 
     def threshold(self, key: str, default: float) -> tuple[float, str]:
         """(seconds, source) -- source is ``learned`` or ``configured``."""
@@ -232,6 +265,21 @@ class Baselines:
             tol = e["tol"]
         self._touch()
         return tol
+
+    def undo_feedback(self, key: str, real: bool) -> None:
+        """Take back an earlier verdict, so correcting one does not count twice."""
+        with self._lock:
+            e = self._s.get(key)
+            if not isinstance(e, dict):
+                return
+            if real:
+                e["real_outages"] = max(0, e["real_outages"] - 1)
+                e["tol"] = DEFAULT_TOLERANCE + (e["tol"] - DEFAULT_TOLERANCE) / 0.9
+            else:
+                e["false_alarms"] = max(0, e["false_alarms"] - 1)
+                e["tol"] = e["tol"] / 1.25
+            e["tol"] = round(min(MAX_TOLERANCE, max(MIN_TOLERANCE, e["tol"])), 4)
+        self._touch()
 
     # -------------------------------------------------------------- roster
 

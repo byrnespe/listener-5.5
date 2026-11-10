@@ -91,6 +91,12 @@ class Config:
     agent_token: str | None = None  # required for privileged agent tools
     allowed_origins: tuple[str, ...] = ()
     adaptive: bool = True  # learn per-service stale thresholds
+    # Off by default: a learned threshold may be looser than the configured
+    # window but not tighter. Tightening trusts report timing, and reports are
+    # only as trustworthy as whoever can reach the port.
+    adaptive_tighten: bool = False
+    report_token: str | None = None  # when set, POST /self-report needs it
+    report_url_token: str | None = None  # bearer sent with our own reports
     adaptive_floor_seconds: float = 15.0
     adaptive_ceiling_seconds: float = 3600.0
     learn_roster_after: int = 20  # reports before an unregistered peer is "expected"
@@ -139,6 +145,9 @@ class Config:
                 if o.strip()
             ),
             adaptive=_env_bool("LISTENER55_ADAPTIVE", True),
+            adaptive_tighten=_env_bool("LISTENER55_ADAPTIVE_TIGHTEN", False),
+            report_token=_env("LISTENER55_REPORT_TOKEN"),
+            report_url_token=_env("LISTENER55_REPORT_URL_TOKEN"),
             adaptive_floor_seconds=_env_float("LISTENER55_ADAPTIVE_FLOOR", 15.0),
             adaptive_ceiling_seconds=_env_float("LISTENER55_ADAPTIVE_CEILING", 3600.0),
             learn_roster_after=_env_int("LISTENER55_LEARN_ROSTER_AFTER", 20),
@@ -172,6 +181,8 @@ class Config:
             raise ValueError("LISTENER55_MAX_ACTIONS_PER_HOUR must be >= 0")
         if self.agent_token is not None and len(self.agent_token) < 16:
             raise ValueError("LISTENER55_AGENT_TOKEN must be at least 16 characters")
+        if self.report_token is not None and len(self.report_token) < 16:
+            raise ValueError("LISTENER55_REPORT_TOKEN must be at least 16 characters")
         if not (0 < self.adaptive_floor_seconds <= self.adaptive_ceiling_seconds):
             raise ValueError("need 0 < LISTENER55_ADAPTIVE_FLOOR <= LISTENER55_ADAPTIVE_CEILING")
         if self.learn_roster_after < 1:

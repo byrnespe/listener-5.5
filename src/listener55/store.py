@@ -39,6 +39,7 @@ class StateStore:
 
     def __init__(self, state_dir: str | os.PathLike[str] | None = None) -> None:
         self._lock = threading.RLock()
+        self._save_lock = threading.Lock()  # one writer at a time
         self._data: dict[str, Any] = {}
         self._dirty = False
         self.dir: Path | None = Path(state_dir) if state_dir else None
@@ -149,13 +150,14 @@ class StateStore:
                 return False  # still dirty; the next cycle tries again
             self._dirty = False
         path = self.dir / STATE_FILE
-        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(body)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
+            with self._save_lock:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
         except OSError as exc:
             self.save_failures += 1
             with self._lock:

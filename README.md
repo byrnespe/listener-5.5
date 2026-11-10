@@ -93,6 +93,9 @@ listener55 --once-report
 | `LISTENER55_AGENT_TOKEN` | _(none)_ | Bearer token for privileged agent tools (min 16 chars). Unset = privileged tools off |
 | `LISTENER55_ALLOWED_ORIGINS` | _(none)_ | Comma-separated browser origins allowed to call the agent endpoints (loopback always is) |
 | `LISTENER55_ADAPTIVE` | `1` | Learn per-service stale thresholds |
+| `LISTENER55_ADAPTIVE_TIGHTEN` | `0` | Allow a learned threshold to be *shorter* than `LISTENER55_FLEET_STALE_AFTER`. Off: learning only loosens it |
+| `LISTENER55_REPORT_TOKEN` | _(none)_ | When set, `POST /self-report` requires `Authorization: Bearer` with it (min 16 chars). Set this before using `act` |
+| `LISTENER55_REPORT_URL_TOKEN` | _(none)_ | Bearer token this service sends with its own reports to `LISTENER55_REPORT_URL` |
 | `LISTENER55_ADAPTIVE_FLOOR` / `_CEILING` | `15` / `3600` | Bounds for a learned threshold, seconds |
 | `LISTENER55_LEARN_ROSTER_AFTER` | `20` | Reports before an unregistered peer is remembered |
 | `LISTENER55_FORGET_AFTER` | `86400` | Seconds of silence before a remembered peer is forgotten |
@@ -184,13 +187,22 @@ Full detail in [docs/SELF_HEALING.md](docs/SELF_HEALING.md). In short:
   process that is alive but not serving gets restarted.
 - Each service is judged against its own learned cadence. `/fleet` rows carry
   `stale_after_seconds` and `threshold_source` (`learned` or `configured`).
+  By default learning only *loosens* the window (a slow reporter stops being
+  permanently stale); `LISTENER55_ADAPTIVE_TIGHTEN=1` also lets fast
+  reporters be flagged sooner.
 - `status` on `/healthz` is now derived from a sliding window of recent
-  events, and errors age out; the reasons are in `degraded_reasons`.
+  events (two or more failures and over 20% of the window), and errors age
+  out; the reasons are in `degraded_reasons`.
 - When most watched services go quiet together, one `correlated_outage`
   incident opens and automatic remediation is suspended.
 
 Nothing runs a command unless you provide a playbooks file, and nothing runs
 one automatically unless you also set `LISTENER55_AUTONOMY=act`.
+
+**Before using `act`, set `LISTENER55_REPORT_TOKEN`.** `/self-report` is
+otherwise unauthenticated, and a self-report claiming a service is degraded or
+restarting is exactly what triggers a playbook. The service logs a warning at
+startup if `act` is on without it.
 
 ## Driving it from an AI agent
 

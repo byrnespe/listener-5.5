@@ -39,6 +39,7 @@ class SelfReporter:
         report_log_path: Path | None = None,
         http_timeout: float = 5.0,
         post_fn: Callable[[str, bytes, float], tuple[int, str]] | None = None,
+        auth_token: str | None = None,
         breaker: CircuitBreaker | None = None,
         spool: list[str] | None = None,
         on_spool_change: Callable[[], None] | None = None,
@@ -53,6 +54,7 @@ class SelfReporter:
         self.report_url = report_url
         self.report_log_path = report_log_path
         self.http_timeout = http_timeout
+        self._auth_token = auth_token
         self._post_fn = post_fn or self._default_post
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -106,8 +108,8 @@ class SelfReporter:
         """Deliver spooled reports oldest first. Returns an error on the first
         failure, leaving the rest queued; None when the backlog is clear or
         the per-cycle budget is spent."""
-        sent = 0
-        while sent < REPLAY_PER_CYCLE:
+        sent = handled = 0
+        while handled < REPLAY_PER_CYCLE:
             with self._spool_lock:
                 if not self._spool:
                     break
@@ -124,14 +126,16 @@ class SelfReporter:
                         if self._spool and self._spool[0] == body:
                             self._spool.pop(0)
                             self.spool_dropped += 1
+                    handled += 1
                     continue
                 return f"http status {status}"
             with self._spool_lock:
                 if self._spool and self._spool[0] == body:
                     self._spool.pop(0)
             sent += 1
+            handled += 1
             self.replayed += 1
-        if sent and self._on_spool_change:
+        if handled and self._on_spool_change:
             self._on_spool_change()
         return None
 
@@ -206,17 +210,14 @@ class SelfReporter:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
 
-    @staticmethod
-    def _default_post(url: str, body: bytes, timeout: float) -> tuple[int, str]:
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": f"listener-5.5/{__version__}",
-            },
-        )
+    def _default_post(self, url: str, body: bytes, timeout: float) -> tuple[int, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"listener-5.5/{__version__}",
+        }
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {self._auth_token}"
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return int(resp.status), resp.read().decode("utf-8", errors="replace")
 

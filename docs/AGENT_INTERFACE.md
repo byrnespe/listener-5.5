@@ -130,7 +130,11 @@ LISTENER55_AGENT_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe
 - Send `X-Agent-Name: <who you are>` to be identifiable in the audit trail.
 
 Every call is kept in an in-memory audit ring (`audit_log`). Privileged calls
-and failures are also appended to `LISTENER55_STATE_DIR/audit.jsonl`.
+made with the token, and automatic playbook runs, are also appended to
+`LISTENER55_STATE_DIR/audit.jsonl`. Anonymous calls are deliberately not
+written to disk, so they cannot be used to rotate real history out of it.
+
+If `LISTENER55_REPORT_TOKEN` is set, `submit_self_report` becomes privileged.
 
 ## What an agent cannot do
 
