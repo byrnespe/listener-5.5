@@ -94,6 +94,11 @@ ORG_SELF_REPORT_SCHEMA: dict[str, Any] = {
     },
 }
 
+#: Distinct reporters the bus will track. Keys come off the wire, so without a
+#: cap anyone who can reach the port could grow the store without bound.
+MAX_SERVICES = 2000
+MAX_KEY_CHARS = 128
+
 #: Roster states, worst first. Ordering drives the rollup summary.
 STATE_UNKNOWN = "unknown"
 STATE_STALE = "stale"
@@ -132,6 +137,8 @@ class Roster:
         self.load_error: str | None = None
         self.services: dict[str, dict[str, Any]] = {}
         self.tailnet: dict[str, Any] = {}
+        self._mtime: float | None = None
+        self.reloads = 0
         if path is not None:
             self._load(path)
         else:
@@ -139,18 +146,60 @@ class Roster:
 
     def _load(self, path: Path) -> None:
         try:
+            self._mtime = path.stat().st_mtime
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             self.load_error = f"{type(exc).__name__}: {exc}"
             return
-        if data.get("schema_version") != "1.0":
-            self.load_error = f"unsupported registry schema_version {data.get('schema_version')!r}"
+        if not isinstance(data, dict) or data.get("schema_version") != "1.0":
+            version = data.get("schema_version") if isinstance(data, dict) else None
+            self.load_error = f"unsupported registry schema_version {version!r}"
             return
-        self.tailnet = data.get("tailnet", {}) or {}
+        services: dict[str, dict[str, Any]] = {}
         for svc in data.get("services", ()):
-            sid = svc.get("id")
+            sid = svc.get("id") if isinstance(svc, dict) else None
             if sid:
-                self.services[sid] = svc
+                services[sid] = svc
+        # Swap whole objects rather than mutating in place: readers on other
+        # threads see either the old roster or the new one, never half of each.
+        self.tailnet = data.get("tailnet", {}) or {}
+        self.services = services
+        self.load_error = None
+
+    def reload_if_changed(self) -> bool:
+        """Pick up an edited registry without a restart.
+
+        A reload that fails keeps the last good roster: a typo in the
+        registry must not make every service look unregistered.
+        """
+        if self.path is None:
+            return False
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self._mtime:
+            return False
+        return self.reload()
+
+    def reload(self) -> bool:
+        if self.path is None:
+            return False
+        previous = (self.services, self.tailnet, self.load_error)
+        self._load(self.path)
+        if self.load_error is not None and previous[0]:
+            failed = self.load_error
+            self.services, self.tailnet, _ = previous
+            self.load_error = None
+            self.last_reload_error = failed
+            return False
+        self.last_reload_error = None
+        if self.load_error is not None:
+            return False
+        self.reloads += 1
+        return True
+
+    last_reload_error: str | None = None
 
     @property
     def loaded(self) -> bool:
@@ -172,12 +221,16 @@ class Roster:
     def describe(self) -> dict[str, Any]:
         if not self.loaded:
             return {"loaded": False, "reason": self.load_error, "path": str(self.path) if self.path else None}
-        return {
+        out: dict[str, Any] = {
             "loaded": True,
             "path": str(self.path),
             "services": len(self.services),
             "expected_reporters": len(self.expected_ids()),
         }
+        if self.last_reload_error:
+            # Serving the last good roster; say so rather than hide it.
+            out["reload_error"] = self.last_reload_error
+        return out
 
 
 class FleetStore:
@@ -193,6 +246,13 @@ class FleetStore:
         self._lock = threading.Lock()
         # key -> {"report": dict, "received_mono": float, "received_at": str, "count": int}
         self._reports: dict[str, dict[str, Any]] = {}
+        #: Optional learned baselines (``learn.Baselines``). When set, each
+        #: service is judged against its own cadence instead of ``stale_after``.
+        self.advisor: Any = None
+        #: Called with (key, signals) when a report reveals a restart, a crash
+        #: loop or an error spike.
+        self.on_signals: Any = None
+        self.max_services = MAX_SERVICES
 
     # ------------------------------------------------------------- ingest
 
@@ -206,11 +266,15 @@ class FleetStore:
         """
         return str(report.get("registry_id") or report.get("service") or "").strip()
 
-    def ingest(self, report: Any) -> tuple[bool, list[str]]:
+    def ingest(self, report: Any, *, observe: bool = True) -> tuple[bool, list[str]]:
         """Validate and store one self-report.
 
         Returns (accepted, errors). A rejected report is not stored: a bus that
         accepts malformed health is worse than one that accepts none.
+
+        ``observe=False`` stores the report without feeding the learned
+        baselines; the bus uses it for its own read-time self-ingest, whose
+        timing says nothing about a reporting cadence.
         """
         if not isinstance(report, dict):
             return False, ["payload must be a JSON object"]
@@ -220,31 +284,75 @@ class FleetStore:
         key = self.key_for(report)
         if not key:
             return False, ["report has neither registry_id nor service"]
+        if len(key) > MAX_KEY_CHARS:
+            return False, [f"service key longer than {MAX_KEY_CHARS} characters"]
+        now = time.monotonic()
         with self._lock:
             previous = self._reports.get(key)
+            if previous is None and len(self._reports) >= self.max_services:
+                return False, [f"fleet store is full ({self.max_services} services)"]
             self._reports[key] = {
                 "report": report,
-                "received_mono": time.monotonic(),
+                "received_mono": now,
                 "received_at": utc_now_iso(),
                 "count": (previous["count"] + 1) if previous else 1,
             }
+        if observe and self.advisor is not None:
+            signals = self.advisor.observe(key, report, now)
+            if signals and self.on_signals is not None:
+                self.on_signals(key, signals)
         return True, []
+
+    def forget(self, key: str) -> bool:
+        with self._lock:
+            return self._reports.pop(key, None) is not None
+
+    def prune(self, older_than_seconds: float) -> list[str]:
+        """Drop unregistered reporters that have been silent a long time.
+
+        Registered services are never pruned: their silence is the signal.
+        """
+        now = time.monotonic()
+        with self._lock:
+            gone = [
+                k
+                for k, e in self._reports.items()
+                if k not in self.roster.services and now - e["received_mono"] > older_than_seconds
+            ]
+            for k in gone:
+                del self._reports[k]
+        return gone
+
+    def threshold_for(self, key: str) -> tuple[float, str]:
+        """(stale-after seconds, 'learned' | 'configured') for one service."""
+        if self.advisor is not None:
+            return self.advisor.threshold(key, self.stale_after)
+        return self.stale_after, "configured"
 
     # -------------------------------------------------------------- query
 
-    def _state_for(self, entry: dict[str, Any] | None, now: float) -> tuple[str, float | None]:
+    def _state_for(
+        self, entry: dict[str, Any] | None, now: float, stale_after: float | None = None
+    ) -> tuple[str, float | None]:
         if entry is None:
             return STATE_UNKNOWN, None
         age = now - entry["received_mono"]
-        if age > self.stale_after:
+        if age > (self.stale_after if stale_after is None else stale_after):
             return STATE_STALE, age
         status = entry["report"].get("status")
         if status in ("degraded", "stopping"):
             return STATE_DEGRADED, age
         return STATE_HEALTHY, age
 
-    def _row(self, key: str, entry: dict[str, Any] | None, now: float) -> dict[str, Any]:
-        state, age = self._state_for(entry, now)
+    def _row(
+        self,
+        key: str,
+        entry: dict[str, Any] | None,
+        now: float,
+        learned: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        stale_after, source = self.threshold_for(key)
+        state, age = self._state_for(entry, now, stale_after)
         svc = self.roster.services.get(key)
         row: dict[str, Any] = {
             "id": key,
@@ -253,7 +361,13 @@ class FleetStore:
             # registry has never heard of -- worth surfacing, not hiding.
             "registered": svc is not None,
             "expected": bool(svc and svc.get("self_report") and svc.get("status") == "live"),
+            "stale_after_seconds": round(stale_after, 3),
+            "threshold_source": source,
         }
+        if key in learned and not row["expected"]:
+            # Not promised by the registry, but seen often enough that the
+            # bus remembers it and will notice it going quiet.
+            row["learned"] = True
         if svc:
             row["name"] = svc.get("name")
             row["cluster"] = svc.get("cluster")
@@ -284,8 +398,9 @@ class FleetStore:
         now = time.monotonic()
         with self._lock:
             entries = dict(self._reports)
-        keys = set(entries) | set(self.roster.expected_ids())
-        rows = [self._row(k, entries.get(k), now) for k in sorted(keys)]
+        learned = frozenset(self.advisor.learned_ids()) if self.advisor is not None else frozenset()
+        keys = set(entries) | set(self.roster.expected_ids()) | learned
+        rows = [self._row(k, entries.get(k), now, learned) for k in sorted(keys)]
 
         summary = {STATE_HEALTHY: 0, STATE_DEGRADED: 0, STATE_STALE: 0, STATE_UNKNOWN: 0}
         for row in rows:
@@ -302,6 +417,11 @@ class FleetStore:
             "registry": self.roster.describe(),
             "summary": {**summary, "total": len(rows)},
             "needs_attention": [r["id"] for r in actionable],
+            # Remembered-but-unregistered peers that have gone quiet or
+            # degraded. Informational: they never change `status`.
+            "learned_attention": [
+                r["id"] for r in rows if r.get("learned") and r["state"] != STATE_HEALTHY
+            ],
             "services": rows,
         }
 
@@ -310,6 +430,7 @@ class FleetStore:
         now = time.monotonic()
         with self._lock:
             entry = self._reports.get(key)
-        if entry is None and key not in self.roster.services:
+        learned = frozenset(self.advisor.learned_ids()) if self.advisor is not None else frozenset()
+        if entry is None and key not in self.roster.services and key not in learned:
             return None
-        return self._row(key, entry, now)
+        return self._row(key, entry, now, learned)

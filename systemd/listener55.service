@@ -1,22 +1,40 @@
 [Unit]
-Description=listener-5.5 HTTP event listener with self-reporting
+Description=listener-5.5 fleet health bus (self-healing, agent-operable)
 After=network-online.target
 Wants=network-online.target
+# A service that cannot stay up should stop being restarted and show as
+# failed, not spin forever: 10 starts in 5 minutes is the limit.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
-Type=simple
+# notify: the service tells systemd when the port is actually bound, and then
+# pings the watchdog from its supervisor loop. The ping is withheld when the
+# listener stops answering its own /livez, so a wedged process is restarted
+# even though it has not exited.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 WorkingDirectory=%h/projects/listener-5.5
 ExecStart=%h/projects/listener-5.5/.venv/bin/listener55
-Restart=on-failure
+Restart=always
 RestartSec=5
+TimeoutStopSec=15
 Environment=PYTHONUNBUFFERED=1
 Environment=LISTENER55_HOST=127.0.0.1
 Environment=LISTENER55_PORT=8555
 Environment=LISTENER55_REPORT_INTERVAL=30
 Environment=LISTENER55_REPORT_LOG=%h/.local/state/listener55/self-report.jsonl
 Environment=LISTENER55_INSTANCE_ID=%H-listener55
+# Learned baselines, incident memory and the report spool live here.
+Environment=LISTENER55_STATE_DIR=%h/.local/state/listener55
+# observe | suggest | act. This is a ceiling: agents can lower it, not raise it.
+Environment=LISTENER55_AUTONOMY=suggest
 # Optional monitoring sink:
 # Environment=LISTENER55_REPORT_URL=http://127.0.0.1:8791/api/v1/ingest/listener55
+# Optional remediation playbooks (see examples/playbooks.json):
+# Environment=LISTENER55_PLAYBOOKS=%h/.config/listener55/playbooks.json
+# Secrets (LISTENER55_AGENT_TOKEN) belong in a 0600 env file, not in this unit:
 # EnvironmentFile=-%h/.config/listener55.env
 
 # Hardening (user-level)

@@ -52,3 +52,14 @@ jobs:
           assert r['service'] == 'listener-5.5', r
           print('self-report contract emitted:', r['status'])
           "
+      - name: the agent interface needs no third-party package either
+        run: |
+          listener55 tools --format mcp > /tmp/tools.json
+          python3 -c "
+          import json
+          tools = json.load(open('/tmp/tools.json'))
+          names = {t['name'] for t in tools}
+          assert {'fleet_status', 'diagnose', 'run_playbook'} <= names, names
+          assert all('inputSchema' in t for t in tools)
+          print('agent tools available:', len(tools))
+          "
