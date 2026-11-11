@@ -1,0 +1,43 @@
+{
+  "playbooks": [
+    {
+      "name": "restart-user-unit",
+      "description": "Restart the service's systemd user unit",
+      "match": { "service": "*", "kinds": ["stale", "unknown"] },
+      "action": {
+        "type": "command",
+        "argv": ["systemctl", "--user", "restart", "{service}.service"],
+        "timeout": 30
+      },
+      "cooldown_seconds": 300,
+      "max_attempts": 2,
+      "verify_seconds": 120
+    },
+    {
+      "name": "notify-oncall",
+      "description": "Post the incident to the on-call webhook",
+      "match": { "service": "*", "kinds": ["stale", "crash_loop", "degraded"] },
+      "action": {
+        "type": "webhook",
+        "url": "http://127.0.0.1:8791/api/v1/alerts",
+        "timeout": 10
+      },
+      "cooldown_seconds": 900,
+      "max_attempts": 1,
+      "allow_unregistered": true
+    },
+    {
+      "name": "collect-logs",
+      "description": "Capture the last 200 journal lines for a crash-looping unit (never runs automatically)",
+      "match": { "service": "*", "kinds": ["crash_loop"] },
+      "action": {
+        "type": "command",
+        "argv": ["journalctl", "--user", "-u", "{service}.service", "-n", "200", "--no-pager"],
+        "timeout": 20
+      },
+      "cooldown_seconds": 60,
+      "max_attempts": 3,
+      "auto": false
+    }
+  ]
+}

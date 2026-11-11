@@ -4,6 +4,11 @@ HTTP event listener with periodic **self-reporting** (health, uptime, processed
 counts) — and the org's **fleet health bus**: other services POST their
 self-reports here and `GET /fleet` rolls them up against the service registry.
 
+As of 0.2 it also **heals itself**, **learns each service's normal behaviour**,
+**remembers incidents**, and exposes everything as tools that **any AI agent**
+can drive — MCP, OpenAI/Anthropic/Gemini function calling, OpenAPI or plain
+HTTP — without embedding or depending on any model.
+
 Python 3.10+, **stdlib-only runtime** (no Flask/FastAPI). Optional `pytest` + `jsonschema` for dev/CI.
 
 ## Features
@@ -17,6 +22,23 @@ Python 3.10+, **stdlib-only runtime** (no Flask/FastAPI). Optional `pytest` + `j
   - and/or append JSONL to `LISTENER55_REPORT_LOG`
 - Self-report payload validated against `schema/self_report.schema.json`
 - Env-based config; systemd user unit included
+- **Self-healing** ([docs/SELF_HEALING.md](docs/SELF_HEALING.md)): supervisor
+  restarts dead workers, systemd watchdog restarts a wedged process, report
+  sink gets a circuit breaker with spool-and-replay, failed events go to a
+  replayable dead-letter queue, corrupt state is quarantined instead of fatal
+- **Learning**: per-service reporting cadence replaces the one-size stale
+  window; false alarms widen a service's tolerance; crash loops and error
+  spikes are detected against each service's own baseline; unregistered peers
+  seen often enough are remembered
+- **Incident memory**: `GET /incidents` · recurrence counts, MTTR, notes that
+  resurface the next time the same failure happens
+- **Remediation**: operator-defined playbooks, ranked by how often they
+  actually cleared an incident, run under an autonomy ceiling you set
+- **Agent interface** ([docs/AGENT_INTERFACE.md](docs/AGENT_INTERFACE.md)):
+  `POST /mcp` · `listener55 mcp` · `GET /agent/tools?format=…` ·
+  `POST /agent/tools/<name>` · `GET /openapi.json`
+- Ops: `GET /livez` · `GET /readyz` · `GET /metrics/prometheus` ·
+  `GET /insights` · `Idempotency-Key` on event ingest
 
 ## Quick start
 
@@ -62,7 +84,25 @@ listener55 --once-report
 | `LISTENER55_PROCESS_FAIL_RATE` | `0.0` | Test-only fault injection |
 | `LISTENER55_REGISTRY_ID` | `listener-55` | This service's id in the org service registry |
 | `LISTENER55_REGISTRY` | _(auto-discover)_ | Path to `contracts/service-registry.json` |
-| `LISTENER55_FLEET_STALE_AFTER` | `90` | Seconds before a peer's last report counts as stale |
+| `LISTENER55_FLEET_STALE_AFTER` | `90` | Seconds before a peer's last report counts as stale (until a per-service threshold is learned) |
+| `LISTENER55_STATE_DIR` | `$XDG_STATE_HOME/listener55` or `~/.local/state/listener55` | Where learned state, incidents and the audit trail persist. `off` = memory only |
+| `LISTENER55_AUTONOMY` | `suggest` | Ceiling for what the bus does alone: `observe`, `suggest`, `act` |
+| `LISTENER55_PLAYBOOKS` | _(none)_ | Path to remediation playbooks ([example](examples/playbooks.json)) |
+| `LISTENER55_PLAYBOOK_DRY_RUN` | `0` | Log what playbooks would do; run nothing |
+| `LISTENER55_MAX_ACTIONS_PER_HOUR` | `6` | Budget for real playbook runs |
+| `LISTENER55_AGENT_TOKEN` | _(none)_ | Bearer token for privileged agent tools (min 16 chars). Unset = privileged tools off |
+| `LISTENER55_ALLOWED_ORIGINS` | _(none)_ | Comma-separated browser origins allowed to call the agent endpoints (loopback always is) |
+| `LISTENER55_ADAPTIVE` | `1` | Learn per-service stale thresholds |
+| `LISTENER55_ADAPTIVE_TIGHTEN` | `0` | Allow a learned threshold to be *shorter* than `LISTENER55_FLEET_STALE_AFTER`. Off: learning only loosens it |
+| `LISTENER55_REPORT_TOKEN` | _(none)_ | When set, `POST /self-report` requires `Authorization: Bearer` with it (min 16 chars). Set this before using `act` |
+| `LISTENER55_REPORT_URL_TOKEN` | _(none)_ | Bearer token this service sends with its own reports to `LISTENER55_REPORT_URL` |
+| `LISTENER55_ADAPTIVE_FLOOR` / `_CEILING` | `15` / `3600` | Bounds for a learned threshold, seconds |
+| `LISTENER55_LEARN_ROSTER_AFTER` | `20` | Reports before an unregistered peer is remembered |
+| `LISTENER55_FORGET_AFTER` | `86400` | Seconds of silence before a remembered peer is forgotten |
+| `LISTENER55_TICK` | `5` | Supervisor cadence, seconds |
+| `LISTENER55_EVENT_BUFFER` | `200` | Recent-event journal size |
+| `LISTENER55_REPORT_REPLAY` | `1` | Spool undelivered self-reports and replay them when the sink returns |
+| `LISTENER55_URL` | `http://127.0.0.1:$LISTENER55_PORT` | Listener that `listener55 mcp` relays to |
 
 ## Fleet bus
 
@@ -135,6 +175,52 @@ The registry is found via `LISTENER55_REGISTRY`, else by searching
 still aggregates whatever reports arrive, and `/fleet` says why the roster is
 absent instead of implying an empty org. This service still runs standalone.
 
+## Self-healing and learning
+
+Full detail in [docs/SELF_HEALING.md](docs/SELF_HEALING.md). In short:
+
+- A supervisor ticks every `LISTENER55_TICK` seconds. It restarts dead worker
+  threads, reloads an edited registry or playbooks file, turns fleet state
+  into incidents, scores earlier remediations, and saves what it learned.
+- Under the shipped unit (`Type=notify`, `WatchdogSec=60`) the supervisor's
+  watchdog ping depends on the listener answering its own `/livez`, so a
+  process that is alive but not serving gets restarted.
+- Each service is judged against its own learned cadence. `/fleet` rows carry
+  `stale_after_seconds` and `threshold_source` (`learned` or `configured`).
+  By default learning only *loosens* the window (a slow reporter stops being
+  permanently stale); `LISTENER55_ADAPTIVE_TIGHTEN=1` also lets fast
+  reporters be flagged sooner.
+- `status` on `/healthz` is now derived from a sliding window of recent
+  events (two or more failures and over 20% of the window), and errors age
+  out; the reasons are in `degraded_reasons`.
+- When most watched services go quiet together, one `correlated_outage`
+  incident opens and automatic remediation is suspended.
+
+Nothing runs a command unless you provide a playbooks file, and nothing runs
+one automatically unless you also set `LISTENER55_AUTONOMY=act`.
+
+**Before using `act`, set `LISTENER55_REPORT_TOKEN`.** `/self-report` is
+otherwise unauthenticated, and a self-report claiming a service is degraded or
+restarting is exactly what triggers a playbook. The service logs a warning at
+startup if `act` is on without it.
+
+## Driving it from an AI agent
+
+Full detail in [docs/AGENT_INTERFACE.md](docs/AGENT_INTERFACE.md).
+
+```bash
+curl -sS http://127.0.0.1:8555/agent                       # what is offered, and how
+curl -sS 'http://127.0.0.1:8555/agent/tools?format=openai' # catalog in a provider's shape
+curl -sS -X POST http://127.0.0.1:8555/agent/tools/diagnose \
+  -H 'Content-Type: application/json' -d '{"service":"engine-runtime"}'
+listener55 mcp                                             # MCP over stdio
+```
+
+Reading needs no credentials. Tools that change behaviour or run a playbook
+need `Authorization: Bearer $LISTENER55_AGENT_TOKEN`, and are disabled
+entirely while no token is set. An agent chooses among playbooks you wrote;
+it cannot supply a command, and it cannot raise autonomy above your ceiling.
+
 ## Self-report schema
 
 Canonical file for *this service's own* reports:
@@ -143,8 +229,11 @@ stricter than the org contract the bus accepts from peers (it pins
 `service` to `listener-5.5` and fixes the counter set), so anything valid here
 is also valid on the wire.
 
-`GET /healthz` returns this payload plus `registry_id`. That is a superset of
-what the endpoint returned before, so existing callers are unaffected.
+`GET /healthz` returns this payload plus `registry_id` (and
+`degraded_reasons` when degraded). That is a superset of what the endpoint
+returned before, so existing callers are unaffected. `meta` now also carries
+`autonomy`, `incidents_open`, `self_heals` and `reports_spooled`; `meta` was
+always an open object, so the schema is unchanged.
 
 Example payload:
 
@@ -195,6 +284,11 @@ systemctl --user enable --now listener55.service
 systemctl --user status listener55.service
 ```
 
+The unit is `Type=notify` with a watchdog and `Restart=always`. Upgrading from
+0.1: reinstall the package **and** copy the new unit together, then
+`daemon-reload` and restart — the new unit waits for a readiness signal that
+only 0.2 sends.
+
 Runtime choice for org deploy: **systemd user unit** (no Docker). Installer/devops should retain port via `~/.hermes/org/port-assign.py` before binding non-loopback.
 
 ## Deploy handoff (for installer / devops)
@@ -213,6 +307,12 @@ Runtime choice for org deploy: **systemd user unit** (no Docker). Installer/devo
 | Peer report ingest | `POST /self-report` |
 | Org registry id | `listener-55` |
 | Dry-run | `LISTENER55_REPORT_LOG=... listener55 --once-report` |
+| Liveness / readiness | `GET /livez` · `GET /readyz` |
+| Prometheus | `GET /metrics/prometheus` |
+| Incidents / learned state | `GET /incidents` · `GET /insights` |
+| Agent entry point | `GET /agent` · `POST /mcp` · `listener55 mcp` |
+| Persistent state | `LISTENER55_STATE_DIR` (`state.json`, `audit.jsonl`) |
+| Secrets | `LISTENER55_AGENT_TOKEN` via `EnvironmentFile=` (0600) |
 
 ## License
 

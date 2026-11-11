@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,11 +82,27 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+#: Health is judged over a sliding window rather than by the last event, so one
+#: bad payload does not mark the service degraded and one good one does not
+#: clear a real problem. Errors also age out on their own: a service that
+#: failed an hour ago and has been idle since is healthy, not degraded forever.
+HEALTH_WINDOW_SECONDS = 300.0
+HEALTH_WINDOW_EVENTS = 50
+HEALTH_ERROR_RATIO = 0.2
+#: Consecutive failed self-reports before the sink counts as down.
+SINK_FAILURE_STREAK = 3
+
+
 class Metrics:
     """Thread-safe counters for the listener."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._outcomes: deque[tuple[float, bool]] = deque(maxlen=HEALTH_WINDOW_EVENTS)
+        self.report_failure_streak = 0
+        self.internal_errors = 0
+        self.deduplicated = 0
+        self._reasons: list[str] = []
         self.received = 0
         self.processed_ok = 0
         self.processed_error = 0
@@ -110,31 +127,79 @@ class Metrics:
         with self._lock:
             self.received += 1
 
+    def _reassess_locked(self) -> None:
+        """Derive status from the recent window. Caller holds the lock."""
+        if self.status == "stopping":
+            return
+        cutoff = time.monotonic() - HEALTH_WINDOW_SECONDS
+        while self._outcomes and self._outcomes[0][0] < cutoff:
+            self._outcomes.popleft()
+        reasons: list[str] = []
+        total = len(self._outcomes)
+        errors = sum(1 for _, ok in self._outcomes if not ok)
+        # Two or more: a single failure is an event, not a trend, however
+        # small the sample it lands in.
+        if errors >= 2 and errors / total > HEALTH_ERROR_RATIO:
+            reasons.append(
+                f"event error rate {errors}/{total} over the last "
+                f"{int(HEALTH_WINDOW_SECONDS)}s"
+            )
+        if self.report_failure_streak >= SINK_FAILURE_STREAK:
+            reasons.append(
+                f"self-report sink failing ({self.report_failure_streak} consecutive)"
+            )
+        self._reasons = reasons
+        if reasons:
+            self.status = "degraded"
+        elif self.status == "degraded" or (self.status == "starting" and total):
+            self.status = "healthy"
+        if not reasons and not errors and self.report_failure_streak == 0:
+            self.last_error = None
+
     def mark_ok(self) -> None:
         with self._lock:
             self.processed_ok += 1
-            self.last_error = None
-            if self.status in ("starting", "degraded"):
-                self.status = "healthy"
+            self._outcomes.append((time.monotonic(), True))
+            self._reassess_locked()
 
     def mark_error(self, err: str) -> None:
         with self._lock:
             self.processed_error += 1
             self.last_error = err[:500]
-            self.status = "degraded"
+            self._outcomes.append((time.monotonic(), False))
+            self._reassess_locked()
 
     def mark_report_sent(self) -> None:
         with self._lock:
             self.self_reports_sent += 1
+            self.report_failure_streak = 0
+            if self.last_error and self.last_error.startswith("self-report:"):
+                self.last_error = None
+            self._reassess_locked()
 
     def mark_report_failed(self, err: str) -> None:
         with self._lock:
             self.self_reports_failed += 1
+            self.report_failure_streak += 1
             self.last_error = f"self-report: {err[:400]}"
+            self._reassess_locked()
+
+    def mark_internal_error(self) -> None:
+        with self._lock:
+            self.internal_errors += 1
+
+    def mark_deduplicated(self) -> None:
+        with self._lock:
+            self.deduplicated += 1
 
     def set_status(self, status: str) -> None:
         with self._lock:
             self.status = status
+
+    def degraded_reasons(self) -> list[str]:
+        with self._lock:
+            self._reassess_locked()
+            return list(self._reasons)
 
     def uptime_seconds(self) -> float:
         return max(0.0, time.monotonic() - self.started_at_mono)
@@ -148,6 +213,7 @@ class Metrics:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            self._reassess_locked()  # let old errors age out
             payload: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
                 "service": __service_name__,

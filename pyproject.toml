@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "listener55"
-version = "0.1.0"
-description = "5.5 listener service with periodic self-reporting"
+version = "0.2.0"
+description = "5.5 listener: self-healing, self-tuning fleet health bus any AI agent can drive"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
